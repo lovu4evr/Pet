@@ -1,47 +1,32 @@
 
-name: Build APK
+name: SwarmDeck 5.5 - Build APK
 
 on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: Build SwarmDeck APK
     runs-on: ubuntu-latest
     timeout-minutes: 50
 
     steps:
+      # 1. Checkout repository
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Setup Java
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      
-- name: Configure Android SDK
-  run: |
-    echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
-    echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> $GITHUB_ENV
-    echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH
-    echo "/usr/local/lib/android/sdk/cmdline-tools/16.0/bin" >> $GITHUB_PATH
-
-- name: Verify Android SDK
-  run: |
-    echo "SDK: $ANDROID_HOME"
-    sdkmanager --version
-
-- name: Install Android SDK packages
-  run: |
-    yes | sdkmanager --licenses || true
-    sdkmanager --install \
-      "platforms;android-34" \
-      "build-tools;34.0.0" \
-      "platform-tools"
-      
-
+      # 3. Detect project root
       - name: Find project root
         id: find
         shell: bash
@@ -56,46 +41,119 @@ jobs:
               -not -path './.git/*' | head -n 1)
 
             if [[ -z "$S" ]]; then
-              echo "No Gradle project found"
+              echo "::error::No Gradle project found"
               exit 1
             fi
 
             DIR="$(cd "$(dirname "$S")" && pwd)"
           fi
 
-          echo "Project dir: $DIR"
+          echo "Project root: $DIR"
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Configure Android SDK
+      # 4. Detect preinstalled Android SDK
+      - name: Detect Android SDK
+        id: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [[ -z "$SDK" || ! -d "$SDK" ]]; then
+            echo "::error::Android SDK not found on runner"
+            env | grep -E 'ANDROID|JAVA' || true
+            exit 1
+          fi
+
+          echo "Android SDK: $SDK"
+          echo "sdk=$SDK" >> "$GITHUB_OUTPUT"
+
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          SDKMANAGER=$(find "$SDK/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null \
+            | sort -V | tail -n 1)
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::sdkmanager not found in existing SDK"
+            exit 1
+          fi
+
+          echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+          echo "SDK Manager found: $SDKMANAGER"
+
+          ls -la "$SDK/platforms" || true
+          ls -la "$SDK/build-tools" || true
+
+      # 5. Accept licenses and install only required missing packages
+      - name: Verify Android SDK packages
+        shell: bash
+        env:
+          SDK: ${{ steps.android.outputs.sdk }}
+          SDKMANAGER: ${{ steps.android.outputs.sdkmanager }}
+        run: |
+          set -euo pipefail
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          if [[ ! -d "$SDK/platforms/android-34" ]]; then
+            echo "Installing Android 34 platform..."
+            "$SDKMANAGER" --install "platforms;android-34"
+          fi
+
+          if [[ ! -d "$SDK/build-tools/34.0.0" ]]; then
+            echo "Installing Build Tools 34..."
+            "$SDKMANAGER" --install "build-tools;34.0.0"
+          fi
+
+          echo "Android SDK packages ready"
+
+      # 6. Write local.properties
+      - name: Configure local.properties
         env:
           PROJECT_DIR: ${{ steps.find.outputs.dir }}
+          SDK: ${{ steps.android.outputs.sdk }}
         run: |
-          echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_DIR/local.properties"
-          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "sdk.dir=$SDK" > "$PROJECT_DIR/local.properties"
+          cat "$PROJECT_DIR/local.properties"
 
-      - name: Install Android SDK packages
-        run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-          sdkmanager --install \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "platform-tools"
-
-      - name: Setup Gradle
+      # 7. Setup Gradle
+      - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
 
+      # 8. Generate wrapper if missing
       - name: Generate Gradle Wrapper
         working-directory: ${{ steps.find.outputs.dir }}
+        shell: bash
         run: |
-          if [ ! -f gradlew ]; then
+          set -e
+
+          if [[ ! -f gradlew ]]; then
             gradle wrapper --gradle-version 8.7 --no-daemon
           fi
-          chmod +x gradlew
 
+          chmod +x gradlew
+          ./gradlew --version
+
+      # 9. Run unit tests (non-blocking)
+      - name: Run Unit Tests
+        working-directory: ${{ steps.find.outputs.dir }}
+        continue-on-error: true
+        run: |
+          ./gradlew testDebugUnitTest \
+            --no-daemon \
+            --stacktrace
+
+      # 10. Build APK
       - name: Build Debug APK
+        id: build
         working-directory: ${{ steps.find.outputs.dir }}
         shell: bash
         run: |
@@ -108,7 +166,22 @@ jobs:
             -Dorg.gradle.jvmargs="-Xmx3g -XX:+HeapDumpOnOutOfMemoryError" \
             2>&1 | tee build.log
 
-      - name: Upload APK
+      # 11. Display build errors
+      - name: Show Build Errors
+        if: failure()
+        working-directory: ${{ steps.find.outputs.dir }}
+        run: |
+          echo "========== KOTLIN ERRORS =========="
+          grep -E "^e: " build.log | head -50 || true
+
+          echo "========== GRADLE ERRORS =========="
+          grep -A12 "What went wrong" build.log | head -50 || true
+
+          echo "========== LAST 100 LINES =========="
+          tail -100 build.log || true
+
+      # 12. Upload APK
+      - name: Upload SwarmDeck APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -117,11 +190,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build log on failure
+      # 13. Upload failure log
+      - name: Upload Build Log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: SwarmDeck-build-log
+          name: SwarmDeck-5.5-Build-Log
           path: ${{ steps.find.outputs.dir }}/build.log
           if-no-files-found: ignore
           retention-days: 7
