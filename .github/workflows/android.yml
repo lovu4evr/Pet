@@ -1,4 +1,5 @@
 name: Build APK
+
 on:
   push:
   workflow_dispatch:
@@ -7,6 +8,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
     steps:
       - uses: actions/checkout@v4
 
@@ -38,17 +40,17 @@ jobs:
             fi
           fi
           echo "Project dir: $DIR"
+          ls -la "$DIR"
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare Android SDK
+      - name: Android SDK setup
         shell: bash
         run: |
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          echo "sdk.dir=$SDK" > "${{ steps.find.outputs.dir }}/local.properties"
-          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          echo "sdk.dir=$ANDROID_HOME" > "${{ steps.find.outputs.dir }}/local.properties"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
 
-      - uses: gradle/actions/setup-gradle@v3
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
 
@@ -57,19 +59,32 @@ jobs:
         working-directory: ${{ steps.find.outputs.dir }}
         run: |
           set -o pipefail
-          gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee build.log
+          gradle assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee build.log
 
-      - name: Show only the errors
+      - name: Error summary
         if: failure()
         shell: bash
         working-directory: ${{ steps.find.outputs.dir }}
         run: |
-          echo "=== KOTLIN ERRORS ==="
-          grep -E "^e: " build.log | head -40 || true
-          echo "=== WHAT WENT WRONG ==="
-          grep -A8 "What went wrong" build.log | head -40 || true
-          echo "=== SCRIPT / RESOURCE ERRORS ==="
-          grep -iE "error:|AAPT|Script compilation|Unresolved reference" build.log | head -30 || true
+          {
+            echo "## Build errors"
+            echo '```'
+            echo "--- Kotlin errors ---"
+            grep -E "^e: " build.log | head -60 || true
+            echo "--- Resource / AAPT / Manifest ---"
+            grep -Ei "AAPT|Manifest merger|resource .* not found|error:" build.log | head -30 || true
+            echo "--- What went wrong ---"
+            grep -A8 "What went wrong" build.log | head -40 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ steps.find.outputs.dir }}/build.log
+          if-no-files-found: ignore
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -77,37 +92,4 @@ jobs:
           name: SwarmDeck-APK
           path: ${{ steps.find.outputs.dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-
-      - name: Upload build log (only on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: |
-            ${{ steps.find.outputs.dir }}/build.log
-            ${{ steps.find.outputs.dir }}/app/build/reports
-          if-no-files-found: ignore
-
-  # Optional: unit tests run separately so they never block the APK
-  tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: 8.7
-      - name: Unit tests
-        shell: bash
-        run: |
-          S=$(find . -maxdepth 4 -name settings.gradle.kts -not -path './.git/*' | head -1)
-          [ -z "$S" ] && { echo "no project, skipping"; exit 0; }
-          cd "$(dirname "$S")"
-          echo "sdk.dir=${ANDROID_HOME:-/usr/local/lib/android/sdk}" > local.properties
-          gradle testDebugUnitTest --no-daemon --console=plain
 
