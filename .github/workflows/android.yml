@@ -92,4 +92,3 @@ jobs:
           name: SwarmDeck-APK
           path: ${{ steps.find.outputs.dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-
