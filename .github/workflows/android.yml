@@ -1,35 +1,113 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
 
-- name: Find project root
-  id: find
-  shell: bash
-  run: |
-    set -euo pipefail
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
 
-    echo "========== REPOSITORY FILES =========="
-    ls -la
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
 
-    echo "========== SEARCHING GRADLE PROJECT =========="
+      - name: Find project (root / subfolder / zip)
+        id: find
+        shell: bash
+        run: |
+          set -e
+          DIR=""
+          if [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
+            DIR="$PWD"
+          else
+            S=$(find . -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path './.git/*' | head -1)
+            if [ -n "$S" ]; then
+              DIR="$(cd "$(dirname "$S")" && pwd)"
+            else
+              Z=$(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | head -1)
+              if [ -z "$Z" ]; then echo "No project or zip found in repo"; exit 1; fi
+              mkdir -p /tmp/proj
+              unzip -q -o "$Z" -d /tmp/proj
+              S=$(find /tmp/proj \( -name settings.gradle.kts -o -name settings.gradle \) | head -1)
+              if [ -z "$S" ]; then echo "settings.gradle not found inside zip"; exit 1; fi
+              DIR="$(cd "$(dirname "$S")" && pwd)"
+            fi
+          fi
+          echo "Project dir: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-    S=$(find "$GITHUB_WORKSPACE" \
-      -type f \
-      \( -name settings.gradle.kts -o -name settings.gradle \) \
-      -not -path '*/.git/*' \
-      -not -path '*/.gradle/*' \
-      | head -n 1)
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK" > "${{ steps.find.outputs.dir }}/local.properties"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
 
-    if [[ -z "$S" ]]; then
-      echo "::error::No settings.gradle or settings.gradle.kts found"
-      find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | head -100
-      exit 1
-    fi
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
 
-    DIR="$(dirname "$S")"
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.find.outputs.dir }}
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee build.log
 
-    echo "Found Gradle project: $DIR"
+      - name: Show only the errors
+        if: failure()
+        shell: bash
+        working-directory: ${{ steps.find.outputs.dir }}
+        run: |
+          echo "=== KOTLIN ERRORS ==="
+          grep -E "^e: " build.log | head -40 || true
+          echo "=== WHAT WENT WRONG ==="
+          grep -A8 "What went wrong" build.log | head -40 || true
+          echo "=== SCRIPT / RESOURCE ERRORS ==="
+          grep -iE "error:|AAPT|Script compilation|Unresolved reference" build.log | head -30 || true
 
-    if [[ ! -d "$DIR/app" ]]; then
-      echo "::error::Android app module not found in $DIR"
-      exit 1
-    fi
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwarmDeck-APK
+          path: ${{ steps.find.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
 
-    echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+      - name: Upload build log (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            ${{ steps.find.outputs.dir }}/build.log
+            ${{ steps.find.outputs.dir }}/app/build/reports
+          if-no-files-found: ignore
+
+  # Optional: unit tests run separately so they never block the APK
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Unit tests
+        shell: bash
+        run: |
+          S=$(find . -maxdepth 4 -name settings.gradle.kts -not -path './.git/*' | head -1)
+          [ -z "$S" ] && { echo "no project, skipping"; exit 0; }
+          cd "$(dirname "$S")"
+          echo "sdk.dir=${ANDROID_HOME:-/usr/local/lib/android/sdk}" > local.properties
+          gradle testDebugUnitTest --no-daemon --console=plain
+
